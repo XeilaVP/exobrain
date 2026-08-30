@@ -15,7 +15,6 @@ import {
   LogIn,
   Brain,
   TreePine,
-  Save,
   Sun,
   Moon,
   History,
@@ -37,7 +36,6 @@ import { CATEGORY_COLORS, DEFAULT_CATEGORY_COLOR } from "@/lib/categoryColors";
 import { Note } from "@/types/notes";
 import { toast } from "sonner";
 import { useNavigate } from "react-router-dom";
-import { buildTreeSkeleton, motifPath, type BranchMotif } from "@/lib/treeGeometry";
 
 type NodeType = "root" | "category" | "note";
 
@@ -66,10 +64,6 @@ interface Edge {
   from: string;
   to: string;
   kind?: "trunk" | "branch";
-  /** trazo curvo precalculado a partir del motivo Bézier (ver treeGeometry.ts) */
-  d?: string;
-  motif?: BranchMotif;
-  mirror?: boolean;
 }
 
 const ROOT_R = 30;
@@ -96,9 +90,6 @@ const GraphView = () => {
     moveNote,
     canMoveTo,
     updateNote,
-    updateNotePosition,
-    saveNotePositions,
-    clearAllPositions,
     linkNotes,
     toggleNoteCollapsed,
     setSelectedNoteId,
@@ -134,26 +125,18 @@ const GraphView = () => {
     type: "text" | "checklist";
   } | null>(null);
   const [createDialog, setCreateDialog] = useState<{ x: number; y: number } | null>(null);
-  const canvasLongPressTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const canvasLongPressStart = useRef<{ x: number; y: number } | null>(null);
   const [pan, setPan] = useState({ x: 0, y: 0 });
   const [viewZoom, setViewZoom] = useState(1);
   const [isPanning, setIsPanning] = useState(false);
 
-  const longPressTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const didLongPress = useRef(false);
   const didDrag = useRef(false);
   const didPan = useRef(false);
   const clickTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const didInitialFitRef = useRef(false);
   const viewZoomRef = useRef(1);
 
-  // Drag offsets per node id (session-local, hasta que se guarden)
+  // Drag offsets per node id (session-local)
   const [offsets, setOffsets] = useState<Record<string, { dx: number; dy: number }>>({});
-  const notesRef = useRef(notes);
-  notesRef.current = notes;
-  const offsetsRef = useRef(offsets);
-  offsetsRef.current = offsets;
   const dragState = useRef<{ nodeId: string; startX: number; startY: number; baseDx: number; baseDy: number } | null>(
     null,
   );
@@ -211,15 +194,9 @@ const GraphView = () => {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedNoteId]);
 
-  // Congelado por nota: si note.posDx/posDy existen, ESA es la posición real y
-  // absoluta de la nota — el skeleton nunca vuelve a tocarla, sin importar
-  // cuántas hermanas tenga o cuántas notas se añadan/borren en el árbol.
-  // Solo las notas SIN posición guardada (recién creadas, o legacy) usan el
-  // skeleton como semilla: nacen en el hueco que le tocaría según el árbol
-  // automático, anclado a la posición REAL de su padre (no a la posición
-  // teórica del padre en el skeleton puro), para que la rama nueva salga bien
-  // aunque el padre lleve tiempo movido a mano. Esa semilla se persiste sola
-  // en el useEffect de más abajo, y desde ese instante deja de ser "auto".
+  // V3: straight-line branching tree. The shape comes from node placement;
+  // SVG edges are simple straight segments, like Obsidian, but every root starts
+  // from the shared ExoBrain trunk.
   const { positions, edges, parentMap } = useMemo(() => {
     const pos: NodePos[] = [];
     const eds: Edge[] = [];
@@ -230,6 +207,11 @@ const GraphView = () => {
 
     if (rootNotes.length === 0) return { positions: pos, edges: eds, parentMap: parent };
 
+    const descendantsCount = (noteId: string): number => {
+      const children = notes.filter((n) => n.parentNoteId === noteId);
+      return children.reduce((sum, child) => sum + 1 + descendantsCount(child.id), 0);
+    };
+
     const colorForRoot = (rootId: string) => {
       const originalIndex = Math.max(
         0,
@@ -238,121 +220,195 @@ const GraphView = () => {
       return TREE_BRANCH_PALETTE[originalIndex % TREE_BRANCH_PALETTE.length].start;
     };
 
-    const skeleton = buildTreeSkeleton(
-      notes.map((n) => ({ id: n.id, parentId: n.parentNoteId ?? null })),
-      {
-        rootX: W / 2,
-        rootY: H - (isMobile ? 96 : 84),
-        compact: isMobile,
-        collapsed: collapsedIds,
-        hiddenRootIds: hiddenCategoryIds,
-      },
-    );
+    const trunkX = W / 2;
+    const rootY = isMobile ? H - 92 : H - 72;
+    const trunkTopY = isMobile ? Math.max(72, H * 0.1) : Math.max(72, H * 0.08);
+    const trunkBottomY = rootY - (isMobile ? 42 : 46);
 
-    const posIdFor = (junctionId: string) => {
-      const j = skeleton.junctions.find((x) => x.id === junctionId);
-      if (!j) return junctionId;
-      if (j.id === skeleton.rootJunction.id) return "root";
-      return j.noteId ? `note-${j.noteId}` : j.id;
+    pos.push({
+      id: "root",
+      x: trunkX,
+      y: rootY,
+      type: "root",
+      label: brainName || "ExoBrain",
+      color: "220 78% 58%",
+      depth: -1,
+      z: 1,
+    });
+
+    pos.push({
+      id: "trunk-top",
+      x: trunkX,
+      y: trunkTopY,
+      type: "category",
+      label: "",
+      color: "258 74% 68%",
+      depth: -1,
+      isVirtual: true,
+      z: 1,
+    });
+    parent["trunk-top"] = "root";
+    eds.push({ from: "root", to: "trunk-top", kind: "trunk" });
+
+    const ROOT_SLOTS: Array<{ side: -1 | 1; attachT: number; angle: number }> = [
+      { side: -1, attachT: 0.72, angle: -2.9 }, // Psico — lower left
+      { side: 1, attachT: 0.25, angle: -0.95 }, // Ideas — upper right
+      { side: 1, attachT: 0.5, angle: -0.15 }, // Reflexiones — middle right
+      { side: -1, attachT: 0.38, angle: -2.35 }, // Tareas — upper left
+      { side: -1, attachT: 0.22, angle: -2.58 },
+      { side: 1, attachT: 0.67, angle: 0.05 },
+      { side: -1, attachT: 0.56, angle: -3.02 },
+      { side: 1, attachT: 0.36, angle: -0.48 },
+    ];
+
+    const childSlots = (count: number): number[] => {
+      const presets: Record<number, number[]> = {
+        1: [0.1],
+        2: [-0.56, 0.52],
+        3: [-0.78, 0.02, 0.68],
+        4: [-0.88, -0.3, 0.3, 0.82],
+        5: [-0.96, -0.52, -0.05, 0.43, 0.88],
+        6: [-1.0, -0.62, -0.24, 0.18, 0.56, 0.94],
+        7: [-1.02, -0.7, -0.38, -0.05, 0.29, 0.62, 0.96],
+        8: [-1.04, -0.75, -0.46, -0.17, 0.14, 0.43, 0.72, 1.0],
+      };
+      if (presets[count]) return presets[count];
+      return Array.from({ length: count }, (_, i) => (count <= 1 ? 0 : -1.05 + (2.1 * i) / (count - 1)));
     };
 
-    // Posición "pura" del skeleton por nota, solo para poder calcular el
-    // offset semilla de una nota nueva respecto a su padre.
-    const skeletonByNoteId = new Map<string, { x: number; y: number }>();
-    skeleton.junctions.forEach((j) => {
-      if (j.noteId) skeletonByNoteId.set(j.noteId, { x: j.x, y: j.y });
-    });
+    const placeChildren = (
+      parentNote: Note,
+      parentX: number,
+      parentY: number,
+      dirX: number,
+      dirY: number,
+      depth: number,
+      branchRootId: string,
+      side: -1 | 1,
+    ) => {
+      const children = notes.filter((n) => n.parentNoteId === parentNote.id);
+      if (children.length === 0 || collapsedIds.has(parentNote.id)) return;
 
-    skeleton.junctions.forEach((j) => {
-      if (j.id === skeleton.rootJunction.id) {
+      const slots = childSlots(children.length);
+      const dirLen = Math.hypot(dirX, dirY) || 1;
+      const ux = dirX / dirLen;
+      const uy = dirY / dirLen;
+      const nx = -uy;
+      const ny = ux;
+      const baseLength = isMobile ? Math.max(54, 88 - depth * 7) : Math.max(72, 126 - depth * 10);
+
+      children.forEach((child, i) => {
+        const descendants = descendantsCount(child.id);
+        const t = slots[i] ?? 0;
+        const length = baseLength + Math.min(isMobile ? 26 : 52, Math.sqrt(descendants + 1) * (isMobile ? 6 : 10));
+        const forward = length * (0.9 + 0.1 * (1 - Math.min(1, Math.abs(t))));
+        const lateral = length * t * 0.72;
+        let x = parentX + ux * forward + nx * lateral;
+        let y = parentY + uy * forward + ny * lateral;
+
+        const trunkClearance = isMobile ? 26 : 38;
+        if (side === 1) x = Math.max(x, trunkX + trunkClearance);
+        else x = Math.min(x, trunkX - trunkClearance);
+
+        const childId = `note-${child.id}`;
+        const parentId = `note-${parentNote.id}`;
+        const childChildren = notes.filter((n) => n.parentNoteId === child.id);
+        const expanded = childChildren.length > 0 && !collapsedIds.has(child.id);
+        const color = colorForRoot(branchRootId);
+
         pos.push({
-          id: "root",
-          x: j.x,
-          y: j.y,
-          type: "root",
-          label: brainName || "ExoBrain",
-          color: "220 78% 58%",
-          depth: -1,
-          z: 1,
+          id: childId,
+          x,
+          y,
+          type: "note",
+          label: child.title,
+          color,
+          categoryId: child.categoryId ?? undefined,
+          noteId: child.id,
+          parentNoteId: child.parentNoteId,
+          noteType: child.noteType,
+          hasChildren: childChildren.length > 0,
+          isCollapsed: !expanded,
+          isMain: false,
+          depth,
+          branchRootId,
+          side,
+          z: Math.max(0.76, 1 - depth * 0.025),
         });
-        return;
-      }
-
-      if (!j.noteId) {
-        pos.push({
-          id: j.id,
-          x: j.x,
-          y: j.y,
-          type: "category",
-          label: "",
-          color: "258 74% 68%",
-          depth: -1,
-          isVirtual: true,
-          z: 1,
-        });
-        return;
-      }
-
-      const note = notes.find((n) => n.id === j.noteId);
-      if (!note) return;
-
-      const hasSavedPos = note.posDx != null && note.posDy != null;
-      let x: number;
-      let y: number;
-
-      if (hasSavedPos) {
-        // Posición congelada: se usa tal cual, el skeleton no interviene.
-        x = note.posDx as number;
-        y = note.posDy as number;
-      } else {
-        // Nota sin posición propia todavía: nace en el hueco del skeleton,
-        // anclada a la posición REAL (ya resuelta) de su padre si la tiene.
-        const skeletonSelf = { x: j.x, y: j.y };
-        const skeletonParent = note.parentNoteId ? skeletonByNoteId.get(note.parentNoteId) : undefined;
-        const parentResolved = note.parentNoteId
-          ? pos.find((p) => p.id === `note-${note.parentNoteId}`)
-          : undefined;
-
-        if (skeletonParent && parentResolved) {
-          x = parentResolved.x + (skeletonSelf.x - skeletonParent.x);
-          y = parentResolved.y + (skeletonSelf.y - skeletonParent.y);
-        } else {
-          x = skeletonSelf.x;
-          y = skeletonSelf.y;
-        }
-      }
-
-      const children = notes.filter((n) => n.parentNoteId === note.id);
-      const color = colorForRoot(j.branchRootId ?? note.id);
-      pos.push({
-        id: `note-${note.id}`,
-        x,
-        y,
-        type: "note",
-        label: note.title,
-        color,
-        categoryId: note.categoryId ?? undefined,
-        noteId: note.id,
-        parentNoteId: note.parentNoteId,
-        noteType: note.noteType,
-        hasChildren: children.length > 0,
-        isCollapsed: collapsedIds.has(note.id) || children.length === 0,
-        isMain: j.depth === 1,
-        depth: Math.max(0, j.depth - 1),
-        branchRootId: j.branchRootId,
-        z: Math.max(0.6, 1 - Math.max(0, j.depth - 1) * 0.035),
+        parent[childId] = parentId;
+        eds.push({ from: parentId, to: childId, kind: "branch" });
+        placeChildren(child, x, y, x - parentX, y - parentY, depth + 1, branchRootId, side);
       });
-    });
+    };
 
-    skeleton.segments.forEach((seg) => {
-      const from = posIdFor(seg.fromJunctionId);
-      const to = posIdFor(seg.toJunctionId);
-      eds.push({ from, to, kind: seg.kind, d: seg.d, motif: seg.motif, mirror: seg.mirror });
-      parent[to] = from;
+    visibleRoots.forEach((root, visibleIndex) => {
+      const originalIndex = Math.max(
+        0,
+        rootNotes.findIndex((candidate) => candidate.id === root.id),
+      );
+      const fallbackSide: -1 | 1 = originalIndex % 2 === 0 ? -1 : 1;
+      const extra = visibleIndex - ROOT_SLOTS.length;
+      const slot = ROOT_SLOTS[originalIndex] ?? {
+        side: fallbackSide,
+        attachT: Math.max(0.16, Math.min(0.8, 0.2 + Math.floor(Math.max(0, extra) / 2) * 0.09)),
+        angle: fallbackSide === 1 ? -0.42 : -2.7,
+      };
+
+      const trunkSpan = trunkBottomY - trunkTopY;
+      const attachY = trunkTopY + trunkSpan * slot.attachT;
+      const attachId = `attach-${root.id}`;
+      const color = colorForRoot(root.id);
+      const weight = 1 + descendantsCount(root.id);
+      const mainLength = isMobile
+        ? Math.min(150, 92 + Math.sqrt(weight) * 9)
+        : Math.min(265, 150 + Math.sqrt(weight) * 15);
+      const mainX = trunkX + Math.cos(slot.angle) * mainLength;
+      const mainY = attachY + Math.sin(slot.angle) * mainLength;
+      const children = notes.filter((n) => n.parentNoteId === root.id);
+      const expanded = children.length > 0 && !collapsedIds.has(root.id);
+      const mainId = `note-${root.id}`;
+
+      pos.push({
+        id: attachId,
+        x: trunkX,
+        y: attachY,
+        type: "category",
+        label: "",
+        color,
+        depth: -1,
+        isVirtual: true,
+        branchRootId: root.id,
+        side: slot.side,
+        z: 0.98,
+      });
+      parent[attachId] = "root";
+
+      pos.push({
+        id: mainId,
+        x: mainX,
+        y: mainY,
+        type: "note",
+        label: root.title,
+        color,
+        categoryId: root.categoryId ?? undefined,
+        noteId: root.id,
+        parentNoteId: root.parentNoteId,
+        noteType: root.noteType,
+        hasChildren: children.length > 0,
+        isCollapsed: !expanded,
+        isMain: true,
+        depth: 0,
+        branchRootId: root.id,
+        side: slot.side,
+        z: 1,
+      });
+      parent[mainId] = attachId;
+      eds.push({ from: attachId, to: mainId, kind: "branch" });
+      placeChildren(root, mainX, mainY, mainX - trunkX, mainY - attachY, 1, root.id, slot.side);
     });
 
     return { positions: pos, edges: eds, parentMap: parent };
-  }, [notes, rootNotes, brainName, size.w, size.h, collapsedIds, hiddenCategoryIds]);
+  }, [notes, rootNotes, visibleRoots, brainName, size.w, size.h, collapsedIds]);
 
   // Apply drag offsets — propagate ancestor offsets to descendants so dragging a
   // node moves its whole subtree along with it.
@@ -379,25 +435,6 @@ const GraphView = () => {
     });
   }, [positions, offsets, parentMap]);
 
-    // Congela en BD, sin que el usuario tenga que arrastrarlas, cualquier nota
-  // que todavía no tenga posición propia (recién creada, o legacy de antes de
-  // este fix). En cuanto se persiste, hasSavedPos pasa a true en el próximo
-  // render y el skeleton deja de tocarla para siempre.
-  useEffect(() => {
-    const toPersist = positions
-      .filter((p) => p.type === "note" && p.noteId)
-      .map((p) => {
-        const note = notes.find((n) => n.id === p.noteId);
-        if (!note || (note.posDx != null && note.posDy != null)) return null;
-        return { id: note.id, dx: p.x, dy: p.y };
-      })
-      .filter((v): v is { id: string; dx: number; dy: number } => v !== null);
-
-    if (toPersist.length > 0) {
-      void saveNotePositions(toPersist);
-    }
-  }, [positions, notes, saveNotePositions]);
-  
   const getPos = (id: string) => positionsWithOffsets.find((p) => p.id === id);
 
   const getNodeRadius = useCallback((node: NodePos) => {
@@ -514,65 +551,6 @@ const GraphView = () => {
     return () => el.removeEventListener("wheel", onWheel);
   }, [zoomAt]);
 
-  // Long-press handlers
-  const startLongPress = useCallback(
-    (nodeId: string, clientX: number, clientY: number) => {
-      didLongPress.current = false;
-      longPressTimer.current = setTimeout(() => {
-        didLongPress.current = true;
-        // If linking and this is a note
-        if (linkingNoteId && nodeId.startsWith("note-")) {
-          const targetId = nodeId.replace("note-", "");
-          if (targetId !== linkingNoteId) {
-            setConfirmDialog({
-              message: "¿Enlazar estas dos notas?",
-              onConfirm: () => {
-                linkNotes(linkingNoteId, targetId);
-                setLinkingNoteId(null);
-                setConfirmDialog(null);
-                toast.success("Notas enlazadas");
-              },
-            });
-          }
-          return;
-        }
-        setContextMenu({ nodeId, x: clientX, y: clientY });
-      }, 550);
-    },
-    [linkingNoteId, linkNotes],
-  );
-
-  const cancelLongPress = useCallback(() => {
-    if (longPressTimer.current) {
-      clearTimeout(longPressTimer.current);
-      longPressTimer.current = null;
-    }
-  }, []);
-
-  // Al soltar una nota arrastrada, su desplazamiento de sesión (offsets[nodeId])
-  // se suma al desplazamiento ya guardado (note.posDx/posDy) y se persiste. No
-  // hace falta tocar los hijos: al recalcular posiciones, cada nota suma el
-  // desplazamiento de todos sus ancestros, así que el subárbol la sigue solo.
-  const persistDragged = useCallback(
-    (nodeId: string, dx: number, dy: number) => {
-      if (!nodeId.startsWith("note-")) return;
-      const noteId = nodeId.replace("note-", "");
-      const note = notesRef.current.find((n) => n.id === noteId);
-      if (!note) return;
-      const newDx = (note.posDx ?? 0) + dx;
-      const newDy = (note.posDy ?? 0) + dy;
-      setOffsets((prev) => {
-        const next = { ...prev };
-        delete next[nodeId];
-        return next;
-      });
-      void updateNotePosition(noteId, newDx, newDy);
-    },
-    [updateNotePosition],
-  );
-  const persistDraggedRef = useRef(persistDragged);
-  persistDraggedRef.current = persistDragged;
-
   // Drag / pan / pinch pointer handlers (window-level)
   useEffect(() => {
     const onDown = (e: PointerEvent) => {
@@ -601,7 +579,6 @@ const GraphView = () => {
         });
         panState.current = null;
         dragState.current = null;
-        cancelLongPress();
         didPan.current = true;
         setIsPanning(true);
       }
@@ -610,16 +587,6 @@ const GraphView = () => {
       // Update tracked pointer position
       if (pointersRef.current.has(e.pointerId)) {
         pointersRef.current.set(e.pointerId, { x: e.clientX, y: e.clientY });
-      }
-
-      // Cancel canvas long-press if pointer moved too far
-      if (canvasLongPressTimer.current && canvasLongPressStart.current) {
-        const s = canvasLongPressStart.current;
-        if (Math.hypot(e.clientX - s.x, e.clientY - s.y) > 8) {
-          clearTimeout(canvasLongPressTimer.current);
-          canvasLongPressTimer.current = null;
-          canvasLongPressStart.current = null;
-        }
       }
 
       // Pinch (two active pointers): zoom + pan following centroid
@@ -650,7 +617,6 @@ const GraphView = () => {
         const rawDy = e.clientY - ds.startY;
         if (!didDrag.current && Math.hypot(rawDx, rawDy) > 5) {
           didDrag.current = true;
-          cancelLongPress();
         }
         if (didDrag.current) {
           const zoom = viewZoomRef.current || 1;
@@ -673,21 +639,7 @@ const GraphView = () => {
     };
     const onUp = (e: PointerEvent) => {
       pointersRef.current.delete(e.pointerId);
-      const ds = dragState.current;
       dragState.current = null;
-
-      // Si se soltó tras un arrastre real, persistir la posición manual.
-      if (ds && didDrag.current) {
-        const off = offsetsRef.current[ds.nodeId];
-        if (off) persistDraggedRef.current(ds.nodeId, off.dx, off.dy);
-      }
-
-      // Cancel canvas long-press if pointer released before timer fired
-      if (canvasLongPressTimer.current) {
-        clearTimeout(canvasLongPressTimer.current);
-        canvasLongPressTimer.current = null;
-      }
-      canvasLongPressStart.current = null;
 
       // End pinch when going below 2 pointers; do NOT continue as pan (1-finger canvas pan disabled on touch)
       if (pinchState.current && pointersRef.current.size < 2) {
@@ -709,17 +661,13 @@ const GraphView = () => {
       window.removeEventListener("pointerup", onUp);
       window.removeEventListener("pointercancel", onUp);
     };
-  }, [cancelLongPress]);
+  }, []);
 
   // Click handling with double-click detection
   const handleNodeClick = useCallback(
     (nodeId: string, clientX: number, clientY: number) => {
       if (didDrag.current) {
         didDrag.current = false;
-        return;
-      }
-      if (didLongPress.current) {
-        didLongPress.current = false;
         return;
       }
       if (contextMenu) {
@@ -878,31 +826,12 @@ const GraphView = () => {
           };
           panState.current = null;
           dragState.current = null;
-          cancelLongPress();
-          if (canvasLongPressTimer.current) {
-            clearTimeout(canvasLongPressTimer.current);
-            canvasLongPressTimer.current = null;
-          }
-          canvasLongPressStart.current = null;
           didPan.current = true;
           setIsPanning(true);
           return;
         }
 
         if (!onBackground) return;
-
-        // Long-press on empty canvas -> open "create" dialog (works for touch and mouse)
-        canvasLongPressStart.current = { x: e.clientX, y: e.clientY };
-        if (canvasLongPressTimer.current) clearTimeout(canvasLongPressTimer.current);
-        canvasLongPressTimer.current = setTimeout(() => {
-          canvasLongPressTimer.current = null;
-          // Only trigger if user hasn't started panning/pinching
-          if (didPan.current || pinchState.current || pointersRef.current.size >= 2) return;
-          setCreateDialog({ x: e.clientX, y: e.clientY });
-          // Cancel any pending pan so the click after release doesn't act
-          panState.current = null;
-          didPan.current = true;
-        }, 550);
 
         // Touch: 1-finger canvas pan is disabled (use 2 fingers). Only mouse/pen pans with one pointer.
         if (e.pointerType === "touch") return;
@@ -1006,11 +935,7 @@ const GraphView = () => {
               : rootId
                 ? `url(#tree-branch-${svgSafeId(rootId)})`
                 : `hsl(${to.color})`;
-            // La rama se traza siempre entre las posiciones ACTUALES de madre e
-            // hija (incluido cualquier desplazamiento manual/arrastre), reutilizando
-            // el mismo motivo Bézier ya asignado — así nunca se desconecta un trazo
-            // ni cambia de forma al mover un nodo.
-            const d = edge.motif ? motifPath(from, to, edge.motif, !!edge.mirror) : branchPath(from, to, kind);
+            const d = branchPath(from, to, kind);
 
             return (
               <g key={`be-${idx}`} style={{ opacity, transition: "opacity 260ms ease" }}>
@@ -1111,10 +1036,7 @@ const GraphView = () => {
                     baseDx: cur.dx,
                     baseDy: cur.dy,
                   };
-                  startLongPress(node.id, e.clientX, e.clientY);
                 }}
-                onPointerUp={cancelLongPress}
-                onPointerLeave={cancelLongPress}
                 onClick={(e) => {
                   e.stopPropagation();
                   handleNodeClick(node.id, e.clientX, e.clientY);
@@ -1466,35 +1388,13 @@ const GraphView = () => {
         <button
           onClick={(e) => {
             e.stopPropagation();
-            // Persistir cualquier arrastre en curso antes de "confirmar" visualmente.
-            Object.entries(offsetsRef.current).forEach(([nodeId, off]) => {
-              persistDragged(nodeId, off.dx, off.dy);
-            });
-            toast.success("Disposición guardada");
+            setOffsets({});
+            setFocusNoteId(null);
+            fitFullTree();
+            setShowFilterPanel(false);
           }}
           className="p-2.5 md:p-2 min-h-11 min-w-11 md:min-h-0 md:min-w-0 rounded-xl surface-glass hover:bg-muted/40 text-muted-foreground transition-all flex items-center justify-center"
-          title="Guardar disposición actual del árbol"
-        >
-          <Save size={16} />
-        </button>
-
-        <button
-          onClick={(e) => {
-            e.stopPropagation();
-            setConfirmDialog({
-              message: "¿Restablecer el árbol al reparto automático? Se perderán todas las posiciones que hayas movido a mano.",
-              onConfirm: () => {
-                setOffsets({});
-                void clearAllPositions();
-                setFocusNoteId(null);
-                fitFullTree();
-                setShowFilterPanel(false);
-                setConfirmDialog(null);
-              },
-            });
-          }}
-          className="p-2.5 md:p-2 min-h-11 min-w-11 md:min-h-0 md:min-w-0 rounded-xl surface-glass hover:bg-muted/40 text-muted-foreground transition-all flex items-center justify-center"
-          title="Restablecer al reparto automático"
+          title="Restablecer vista del árbol"
         >
           <TreePine size={16} />
         </button>
