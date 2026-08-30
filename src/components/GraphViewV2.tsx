@@ -91,7 +91,6 @@ const GraphView = () => {
     canMoveTo,
     updateNote,
     linkNotes,
-    toggleNoteCollapsed,
     setSelectedNoteId,
     selectedNoteId,
     brainName,
@@ -663,13 +662,19 @@ const GraphView = () => {
     };
   }, []);
 
-  // Click handling with double-click detection
+  // Click simple = selección visual / doble click = abrir nota.
   const handleNodeClick = useCallback(
     (nodeId: string, clientX: number, clientY: number) => {
+      // Tras drag o pinch/pan no debe dispararse selección ni apertura.
       if (didDrag.current) {
         didDrag.current = false;
         return;
       }
+      if (didPan.current) {
+        didPan.current = false;
+        return;
+      }
+
       if (contextMenu) {
         setContextMenu(null);
         return;
@@ -678,51 +683,44 @@ const GraphView = () => {
       if (clickTimer.current) {
         clearTimeout(clickTimer.current);
         clickTimer.current = null;
-        // Double click: plegar/desplegar manualmente (no altera pan ni zoom)
+
+        // Doble click: abrir la nota.
         if (nodeId.startsWith("note-")) {
           const nId = nodeId.replace("note-", "");
-          const hasChildren = notes.some((n) => n.parentNoteId === nId);
-          if (hasChildren) {
-            setCollapsedIds((prev) => {
-              const next = new Set(prev);
-              if (next.has(nId)) next.delete(nId);
-              else next.add(nId);
-              return next;
-            });
-            toggleNoteCollapsed(nId);
-          }
+          setSelectedNoteId(nId);
+          setOpenPostIt({ noteId: nId, x: clientX, y: clientY });
         } else if (nodeId === "root") {
           setShowBrainDialog(true);
         }
         return;
       }
+
       clickTimer.current = setTimeout(() => {
         clickTimer.current = null;
-        if (nodeId.startsWith("note-")) {
-          const nId = nodeId.replace("note-", "");
-          // If linking via single click on second note
-          if (linkingNoteId && linkingNoteId !== nId) {
-            setConfirmDialog({
-              message: "¿Enlazar estas dos notas?",
-              onConfirm: () => {
-                linkNotes(linkingNoteId, nId);
-                setLinkingNoteId(null);
-                setConfirmDialog(null);
-                toast.success("Notas enlazadas");
-              },
-            });
-            return;
-          }
-          // Selección puramente visual: resalta la rama y atenúa el resto.
-          setFocusNoteId(nId);
-          setOpenPostIt({ noteId: nId, x: clientX, y: clientY });
-        } else if (nodeId === "root") {
-          // single click on root opens rename
-          setShowBrainDialog(true);
+
+        if (!nodeId.startsWith("note-")) return;
+
+        const nId = nodeId.replace("note-", "");
+
+        // Si se está creando un enlace, el click simple selecciona el destino.
+        if (linkingNoteId && linkingNoteId !== nId) {
+          setConfirmDialog({
+            message: "¿Enlazar estas dos notas?",
+            onConfirm: () => {
+              linkNotes(linkingNoteId, nId);
+              setLinkingNoteId(null);
+              setConfirmDialog(null);
+              toast.success("Notas enlazadas");
+            },
+          });
+          return;
         }
+
+        // Click simple: solo selección visual.
+        setFocusNoteId(nId);
       }, 240);
     },
-    [contextMenu, notes, toggleNoteCollapsed, linkingNoteId, linkNotes],
+    [contextMenu, linkingNoteId, linkNotes, setSelectedNoteId],
   );
 
   // Straight SVG segments: the layout creates the tree silhouette.
@@ -739,22 +737,46 @@ const GraphView = () => {
     return 0.78;
   };
 
-  // Rama con protagonismo: subárbol de la raíz del nodo enfocado
+  // Selección visual:
+  // - nota normal: ella + hijas directas + notas enlazadas
+  // - tema/rama principal: toda su rama jerárquica
   const focusIds = useMemo(() => {
     if (!focusNoteId) return null;
-    let cur = notes.find((n) => n.id === focusNoteId);
-    if (!cur) return null;
-    while (cur.parentNoteId) {
-      const p = notes.find((n) => n.id === cur!.parentNoteId);
-      if (!p) break;
-      cur = p;
+
+    const selected = notes.find((n) => n.id === focusNoteId);
+    if (!selected) return null;
+
+    const ids = new Set<string>();
+    ids.add(`note-${selected.id}`);
+
+    if (!selected.parentNoteId) {
+      // Un tema principal activa toda su rama.
+      ids.add("root");
+      ids.add("trunk-top");
+      ids.add(`attach-${selected.id}`);
+
+      const visit = (id: string) => {
+        notes
+          .filter((n) => n.parentNoteId === id)
+          .forEach((child) => {
+            ids.add(`note-${child.id}`);
+            visit(child.id);
+          });
+      };
+
+      visit(selected.id);
+    } else {
+      // Una nota normal activa sus hijas directas.
+      notes
+        .filter((n) => n.parentNoteId === selected.id)
+        .forEach((child) => ids.add(`note-${child.id}`));
+
+      // Y también sus relaciones por enlace.
+      selected.linkedNoteIds.forEach((linkedId) => {
+        ids.add(`note-${linkedId}`);
+      });
     }
-    const ids = new Set<string>(["root", "trunk-top", `attach-${cur.id}`]);
-    const visit = (id: string) => {
-      ids.add(`note-${id}`);
-      notes.filter((n) => n.parentNoteId === id).forEach((c) => visit(c.id));
-    };
-    visit(cur.id);
+
     return ids;
   }, [focusNoteId, notes]);
 
@@ -1026,7 +1048,8 @@ const GraphView = () => {
                   transition: "filter 300ms ease",
                 }}
                 onPointerDown={(e) => {
-                  e.stopPropagation();
+                  // No detener la propagación: el canvas necesita recibir también
+                  // los pointers que empiezan sobre una nota para detectar pinch.
                   didDrag.current = false;
                   const cur = offsets[node.id] || { dx: 0, dy: 0 };
                   dragState.current = {
